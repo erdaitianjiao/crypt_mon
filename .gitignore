@@ -1,0 +1,4 @@
+*.o
+*.img
+test_dir/*
+.vscode/*

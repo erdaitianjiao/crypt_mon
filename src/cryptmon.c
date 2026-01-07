@@ -1,58 +1,73 @@
-#include "vmlinux.h"
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <bpf/libbpf.h>
 #include "cryptmon.h"
+#include "cryptmon.skel.h"
 
-// 记录进入时间
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, u32);   // PID
-    __type(value, u64); // 入口时间戳
-} start_times SEC(".maps");
+static volatile bool exiting = false;
 
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
-} rb SEC(".maps");
+static void sig_handler(int sig) {
+    exiting = true;
+}
 
-// 进入加密核心函数
-SEC("kprobe/crypt_convert")
-int BPF_KPROBE(crypt_convert_enter)
-{
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    u64 ts = bpf_ktime_get_ns();
-
-    bpf_map_update_elem(&start_times, &pid, &ts, BPF_ANY);
+// 处理从内核传来的数据
+static int handle_event(void *ctx, void *data, size_t data_sz) {
+    const struct event *e = data;
+    printf("PID: %-6u | COMM: %-16s | %-20s | Crypt: %7.2f us | Total: %8.2f us\n", 
+           e->pid, e->comm, e->cipher, 
+		   e->crypt_time_ns / 1000.0,
+		   e->total_time_ns / 1000.0);
     return 0;
 }
 
-// 离开加密核心函数
-SEC("kretprobe/crypt_convert")
-int BPF_KRETPROBE(crypt_convert_exit)
-{
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    u64 *start_ts, end_ts, duration;
-    struct event *e;
+int main(int argc, char **argv) {
+    struct cryptmon_bpf *skel;
+    struct ring_buffer *rb = NULL;
+    int err;
 
-    start_ts = bpf_map_lookup_elem(&start_times, &pid);
-    if (!start_ts)
-        return 0;
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
 
-    end_ts = bpf_ktime_get_ns();
-    duration = end_ts - *start_ts;
-
-    // 填充数据发送给用户态
-    e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-    if (e) {
-        e->pid = pid;
-        e->duration_ns = duration;
-        bpf_get_current_comm(&e->comm, sizeof(e->comm));
-        bpf_ringbuf_submit(e, 0);
+    // 1. 打开并加载 BPF 骨架
+    skel = cryptmon_bpf__open_and_load();
+    if (!skel) {
+        fprintf(stderr, "Failed to open and load BPF skeleton\n");
+        return 1;
     }
 
-    bpf_map_delete_elem(&start_times, &pid);
-    return 0;
-}
+    // 2. 附加挂载点
+    err = cryptmon_bpf__attach(skel);
+    if (err) {
+        fprintf(stderr, "Failed to attach BPF skeleton\n");
+        goto cleanup;
+    }
 
-char LICENSE[] SEC("license") = "GPL";
+    // 3. 设置 Ring Buffer 监听
+    rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
+    if (!rb) {
+        fprintf(stderr, "Failed to create ring buffer\n");
+        goto cleanup;
+    }
+
+    printf("Cryptmon started! Monitoring dm-crypt (crypt_convert) latency...\n");
+    printf("%-10s | %-16s | %-15s\n", "PID", "COMM", "LATENCY");
+
+    // 4. 循环读取数据
+    while (!exiting) {
+        err = ring_buffer__poll(rb, 100);
+        if (err == -EINTR) {
+            err = 0;
+            continue;
+        }
+        if (err < 0) {
+            printf("Error polling ring buffer: %d\n", err);
+            break;
+        }
+    }
+
+cleanup:
+    ring_buffer__free(rb);
+    cryptmon_bpf__destroy(skel);
+    return err < 0 ? -err : 0;
+}
