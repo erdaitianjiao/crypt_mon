@@ -4,10 +4,20 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
+struct crypt_info {
+	char cliper_name[32];
+	
+
+
+};
+
 // 进入加密层
 SEC("kprobe/crypt_map")
 int BPF_KPROBE(crypt_map, struct dm_target *ti, struct bio *bio)
-{
+{	
+	u64 ts = bpf_ktime_get_ns();
+	void *io_ptr = (void *)dm_per_bio_data(bio, BPF_CORE_READ(ti, per_io_data_size));
+
 	bpf_printk(">>> crypt_map: bio=%p\n", bio);
 	return 0;
 }
