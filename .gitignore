@@ -2,3 +2,5 @@
 *.img
 test_dir/*
 .vscode/*
+cryptmon
+*.swp
